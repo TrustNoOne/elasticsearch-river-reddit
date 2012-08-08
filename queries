@@ -1,0 +1,3 @@
+curl -XPUT 'localhost:9200/_river/reactiongifs/_meta' -d '{ "type" : "reddit", "index" : { "bulk_size" : 1 } }'
+curl -XDELETE 'localhost:9200/_river/reactiongifs/'
+curl -XPOST 'localhost:9200/reactiongifs/_search' -d '{ "sort" : [ "id" ], "size" : 1, "query":{"match_all":{}} }'
