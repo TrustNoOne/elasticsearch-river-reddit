@@ -118,7 +118,14 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 		} catch (Exception e) {
 			if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
 				// that's fine, get the first and last ids
-				retrieveIndicizedIds();
+				SearchResponse resp = new SearchRequestBuilder(client).setSize(1).setIndices(indexName).addSort("id", SortOrder.DESC)
+						.execute().actionGet();
+
+				SearchHit[] hits = resp.getHits().getHits();
+				if (hits.length > 0) {
+					mostRecentId = hits[0].getId();
+					logger.info("Most Recent id in index: {}", mostRecentId);
+				}
 			} else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
 				// ok, not recovered yet..., lets start indexing and hope we
 				// recover by the first bulk
@@ -145,32 +152,11 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 			thread.interrupt();
 	}
 
-	private void retrieveIndicizedIds() {
-		SearchResponse resp = new SearchRequestBuilder(client).setIndices(indexName).setSize(1)
-				.addSort("id", SortOrder.ASC).execute().actionGet();
-		SearchHit[] hits = resp.getHits().getHits();
-
-		if (hits.length > 0) {
-			leastRecentId = hits[0].getId();
-			logger.info("Least Recent id in index: {}", leastRecentId);
-		}
-
-		resp = new SearchRequestBuilder(client).setSize(1).setIndices(indexName).addSort("id", SortOrder.DESC)
-				.execute().actionGet();
-
-		hits = resp.getHits().getHits();
-		if (hits.length > 0) {
-			mostRecentId = hits[0].getId();
-			logger.info("Most Recent id in index: {}", mostRecentId);
-		}
-
-	}
-
 	public class RedditCrawler implements Runnable {
 		HttpURLConnection connection = null;
 		// when we have them all..
 		boolean stopGoingBackwards = false;
-		
+
 		@Override
 		public void run() {
 			while (true) {
@@ -179,14 +165,17 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 
 				try {
 					// from most recent
-					RetrievedInterval retrieved = retrieveStories(mostRecentId, true);
+					RetrievedInterval retrieved = retrieveStories(null);
+					if (mostRecentId != null && !mostRecentId.equals(retrieved.getFirstId()))
+						logger.info("Indicized some new stories...");
+
 					mostRecentId = retrieved.getFirstId();
 					if (leastRecentId == null)
 						leastRecentId = retrieved.getLastId();
 
 					// until least recent
 					if (leastRecentId != null && !stopGoingBackwards) {
-						retrieved = retrieveStories(leastRecentId, false);
+						retrieved = retrieveStories(leastRecentId);
 						if (retrieved.getCount() == 0) {
 							// last backward search has 0 results
 							logger.info("Stopped going backwards, we have them all!");
@@ -208,13 +197,12 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 			}
 		}
 
-		private RetrievedInterval retrieveStories(String fromId, boolean forward) throws MalformedURLException,
-				IOException {
+		private RetrievedInterval retrieveStories(String afterId) throws MalformedURLException, IOException {
 			String currentAddress = serverAddress;
-			if (fromId != null && forward)
-				currentAddress += "&before=" + fromId;
-			else if (fromId != null && !forward)
-				currentAddress += "&after=" + fromId;
+			// if (fromId != null && forward)
+			// currentAddress += "&before=" + fromId;
+			if (afterId != null)
+				currentAddress += "&after=" + afterId;
 
 			InputStreamReader inputStreamReader = null;
 			HttpURLConnection connection = null;
@@ -261,10 +249,8 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 					currentRequest.add(Requests.indexRequest(indexName).type(typeName).id(id).create(true)
 							.source(builder));
 				}
-				if (stories.size() > 0)
-					logger.info("Got {} {} stories", stories.size(), forward ? "new" : "old");
-				else
-					logger.debug("Got 0 {} stories", forward ? "new" : "old");
+
+				logger.debug("Got {} {} stories", stories.size(), afterId == null ? "new" : "old");
 
 				processBulkIfNeeded();
 
@@ -318,5 +304,8 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 			}
 		}
 	}
+
+
+
 
 }
