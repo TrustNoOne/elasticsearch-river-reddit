@@ -40,71 +40,59 @@ import org.json.simple.JSONValue;
 public class RedditRiver extends AbstractRiverComponent implements River {
 
 	protected final ThreadPool threadPool;
-
 	private final Client client;
-
-	private String indexName;
-
-	private String typeName;
-
-	private int bulkSize;
-
-	private int dropThreshold;
-
 	private AtomicInteger onGoingBulks = new AtomicInteger();
-
 	private volatile BulkRequestBuilder currentRequest;
-
 	private volatile Thread thread;
-
 	private volatile boolean closed = false;
 
+	// ES parameters
+	private String indexName;
+	private String typeName;
+	private int bulkSize;
+	private int dropThreshold;
+
+	// Reddit parameters
 	private final String subReddit;
 	private final long sleepTime;
 	private String serverAddress;
+	private int limit = 100;
 
-	private String mostRecentId = null;
-	private String leastRecentId = null;
-	// when we have them all..
-	boolean stopGoingBackwards = false;
+	private String mostRecentId;
+	private String leastRecentId;
 
 	@SuppressWarnings({ "unchecked" })
 	@Inject
-	public RedditRiver(RiverName riverName, RiverSettings settings,
-			Client client, ThreadPool threadPool) {
+	public RedditRiver(RiverName riverName, RiverSettings settings, Client client, ThreadPool threadPool) {
 		super(riverName, settings);
 		this.client = client;
 		this.threadPool = threadPool;
 
+		// reddit settings
 		if (settings.settings().containsKey("reddit")) {
-			Map<String, Object> redditSettings = (Map<String, Object>) settings
-					.settings().get("reddit");
-			subReddit = XContentMapValues.nodeStringValue(
-					redditSettings.get("subreddit"), "reactiongifs");
+			Map<String, Object> redditSettings = (Map<String, Object>) settings.settings().get("reddit");
+			subReddit = XContentMapValues.nodeStringValue(redditSettings.get("subreddit"), "reactiongifs");
 
-			sleepTime = XContentMapValues.nodeLongValue(
-					redditSettings.get("sleeptime"), 60000);
+			sleepTime = XContentMapValues.nodeLongValue(redditSettings.get("sleeptime"), 60000);
+
+			limit = XContentMapValues.nodeIntegerValue(redditSettings.get("sleeptime"), 100);
 		} else {
 			subReddit = "reactionGifs";
 			sleepTime = 60000;
+			limit = 100;
 		}
 
-		serverAddress = "http://www.reddit.com/r/" + subReddit
-				+ "/new.json?sort=new";
+		serverAddress = "http://www.reddit.com/r/" + subReddit + "/new.json?sort=new&limit=" + limit;
 
 		logger.info("creating reddit river for subreddit [{}]", subReddit);
 
+		// index settings
 		if (settings.settings().containsKey("index")) {
-			Map<String, Object> indexSettings = (Map<String, Object>) settings
-					.settings().get("index");
-			indexName = XContentMapValues.nodeStringValue(
-					indexSettings.get("index"), riverName.name());
-			typeName = XContentMapValues.nodeStringValue(
-					indexSettings.get("type"), "reddit_story");
-			this.bulkSize = XContentMapValues.nodeIntegerValue(
-					indexSettings.get("bulk_size"), 100);
-			this.dropThreshold = XContentMapValues.nodeIntegerValue(
-					indexSettings.get("drop_threshold"), 10);
+			Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
+			indexName = XContentMapValues.nodeStringValue(indexSettings.get("index"), riverName.name());
+			typeName = XContentMapValues.nodeStringValue(indexSettings.get("type"), "reddit_story");
+			this.bulkSize = XContentMapValues.nodeIntegerValue(indexSettings.get("bulk_size"), 100);
+			this.dropThreshold = XContentMapValues.nodeIntegerValue(indexSettings.get("drop_threshold"), 10);
 		} else {
 			indexName = riverName.name();
 			typeName = "reddit";
@@ -118,26 +106,19 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 	public void start() {
 		logger.info("starting reddit stream");
 		try {
-			String mapping = XContentFactory.jsonBuilder().startObject()
-					.startObject(typeName).startObject("properties")
-					.startObject("subreddit").field("type", "string")
-					.field("index", "not_analyzed").endObject()
-					.startObject("title").field("type", "string")
-					.field("index", "analyzed").endObject()
-					.startObject("thumbnail").field("type", "string")
-					.field("index", "not_analyzed").endObject()
-					.startObject("permalink").field("type", "string")
-					.field("index", "not_analyzed").endObject()
-					.startObject("created_utc").field("type", "long")
-					.endObject().startObject("url").field("type", "string")
-					.field("index", "not_analyzed").endObject().endObject()
-					.endObject().endObject().string();
-			client.admin().indices().prepareCreate(indexName)
-					.addMapping(typeName, mapping).execute().actionGet();
+			String mapping = XContentFactory.jsonBuilder().startObject().startObject(typeName)
+					.startObject("properties").startObject("subreddit").field("type", "string")
+					.field("index", "not_analyzed").endObject().startObject("title").field("type", "string")
+					.field("index", "analyzed").endObject().startObject("thumbnail").field("type", "string")
+					.field("index", "not_analyzed").endObject().startObject("permalink").field("type", "string")
+					.field("index", "not_analyzed").endObject().startObject("created_utc").field("type", "long")
+					.endObject().startObject("url").field("type", "string").field("index", "not_analyzed").endObject()
+					.endObject().endObject().endObject().string();
+			client.admin().indices().prepareCreate(indexName).addMapping(typeName, mapping).execute().actionGet();
 		} catch (Exception e) {
 			if (ExceptionsHelper.unwrapCause(e) instanceof IndexAlreadyExistsException) {
 				// that's fine, get the first and last ids
-				retrieveFirstAndLastIds();
+				retrieveIndicizedIds();
 			} else if (ExceptionsHelper.unwrapCause(e) instanceof ClusterBlockException) {
 				// ok, not recovered yet..., lets start indexing and hope we
 				// recover by the first bulk
@@ -145,39 +126,15 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 				// listener here, and only start sampling when the block is
 				// removed...
 			} else {
-				logger.warn("failed to create index [{}], disabling river...",
-						e, indexName);
+				logger.warn("failed to create index [{}], disabling river...", e, indexName);
 				return;
 			}
 		}
 		currentRequest = client.prepareBulk();
 
-		thread = EsExecutors.daemonThreadFactory(settings.globalSettings(),
-				"reddit_slurper").newThread(new RedditCrawler());
+		thread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "reddit_slurper").newThread(
+				new RedditCrawler());
 		thread.start();
-
-	}
-
-	private void retrieveFirstAndLastIds() {
-		SearchResponse resp = new SearchRequestBuilder(client)
-				.setIndices(indexName).setSize(1).addSort("id", SortOrder.ASC)
-				.execute().actionGet();
-		SearchHit[] hits = resp.getHits().getHits();
-		if (hits.length > 0) {
-			leastRecentId = hits[0].getId();
-			logger.info("Least Recent id in index: {}", leastRecentId);
-		}
-
-		resp = new SearchRequestBuilder(client).setSize(1)
-				.setIndices(indexName).addSort("id", SortOrder.DESC).execute()
-				.actionGet();
-
-		hits = resp.getHits().getHits();
-		if (hits.length > 0) {
-			mostRecentId = hits[0].getId();
-			logger.info("Most Recent id in index: {}", mostRecentId);
-		}
-
 	}
 
 	@Override
@@ -188,9 +145,32 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 			thread.interrupt();
 	}
 
+	private void retrieveIndicizedIds() {
+		SearchResponse resp = new SearchRequestBuilder(client).setIndices(indexName).setSize(1)
+				.addSort("id", SortOrder.ASC).execute().actionGet();
+		SearchHit[] hits = resp.getHits().getHits();
+
+		if (hits.length > 0) {
+			leastRecentId = hits[0].getId();
+			logger.info("Least Recent id in index: {}", leastRecentId);
+		}
+
+		resp = new SearchRequestBuilder(client).setSize(1).setIndices(indexName).addSort("id", SortOrder.DESC)
+				.execute().actionGet();
+
+		hits = resp.getHits().getHits();
+		if (hits.length > 0) {
+			mostRecentId = hits[0].getId();
+			logger.info("Most Recent id in index: {}", mostRecentId);
+		}
+
+	}
+
 	public class RedditCrawler implements Runnable {
 		HttpURLConnection connection = null;
-
+		// when we have them all..
+		boolean stopGoingBackwards = false;
+		
 		@Override
 		public void run() {
 			while (true) {
@@ -199,10 +179,23 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 
 				try {
 					// from most recent
-					retrieveStories(true);
+					RetrievedInterval retrieved = retrieveStories(mostRecentId, true);
+					mostRecentId = retrieved.getFirstId();
+					if (leastRecentId == null)
+						leastRecentId = retrieved.getLastId();
+
 					// until least recent
-					if (leastRecentId != null && !stopGoingBackwards)
-						retrieveStories(false);
+					if (leastRecentId != null && !stopGoingBackwards) {
+						retrieved = retrieveStories(leastRecentId, false);
+						if (retrieved.getCount() == 0) {
+							// last backward search has 0 results
+							logger.info("Stopped going backwards, we have them all!");
+							stopGoingBackwards = true;
+						} else
+							leastRecentId = retrieved.getLastId();
+					}
+
+					logger.trace("New mostRecentId: {} - New leastRecentId: {}", mostRecentId, leastRecentId);
 
 					logger.debug("sleeping {}", sleepTime);
 					Thread.sleep(sleepTime);
@@ -215,61 +208,41 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 			}
 		}
 
-		private int retrieveStories(boolean forward)
-				throws MalformedURLException, IOException {
-			int storyCount;
+		private RetrievedInterval retrieveStories(String fromId, boolean forward) throws MalformedURLException,
+				IOException {
 			String currentAddress = serverAddress;
-			if (mostRecentId != null && forward)
-				currentAddress += "&before=" + mostRecentId;
-			else if (leastRecentId != null && !forward)
-				currentAddress += "&after=" + leastRecentId;
+			if (fromId != null && forward)
+				currentAddress += "&before=" + fromId;
+			else if (fromId != null && !forward)
+				currentAddress += "&after=" + fromId;
 
 			InputStreamReader inputStreamReader = null;
 			HttpURLConnection connection = null;
 
 			try {
-
-				logger.debug("Requesting Reddit stories at url {} ",
-						currentAddress);
-				connection = (HttpURLConnection) new URL(currentAddress)
-						.openConnection();
-				connection
-						.addRequestProperty(
-								"User-Agent",
-								"gcap's reddit crawler - email me at paradigma@gmail.com if there are any problems!");
+				logger.debug("Requesting Reddit stories at url {} ", currentAddress);
+				connection = (HttpURLConnection) new URL(currentAddress).openConnection();
+				connection.addRequestProperty("User-Agent",
+						"gcap's reddit crawler - email me at paradigma@gmail.com if there are any problems!");
 				connection.setReadTimeout(30000);
 				connection.connect();
 
-				inputStreamReader = new InputStreamReader(
-						connection.getInputStream());
+				inputStreamReader = new InputStreamReader(connection.getInputStream());
 
-				JSONObject obj = (JSONObject) JSONValue
-						.parse(inputStreamReader);
-				JSONArray stories = (JSONArray) ((JSONObject) obj.get("data"))
-						.get("children");
-				storyCount = stories.size();
+				JSONObject data = (JSONObject) (((JSONObject) JSONValue.parse(inputStreamReader)).get("data"));
+				JSONArray stories = (JSONArray) data.get("children");
 
-				if (!forward && storyCount == 0) {
-					logger.info("Stopped going backwards, we have them all!");
-					stopGoingBackwards = true;
-				}
+				String firstId = null, lastId = null;
+				for (int i = 0; i < stories.size(); i++) {
+					JSONObject story = (JSONObject) ((JSONObject) stories.get(i)).get("data");
 
-				if (storyCount > 0)
-					logger.info("Got {} {} stories", storyCount,
-							forward ? "new" : "old");
-				else
-					logger.debug("Got 0 {} stories", forward ? "new" : "old");
-
-				String lastId = null;
-				for (int i = 0; i < storyCount; i++) {
-					JSONObject story = (JSONObject) ((JSONObject) stories
-							.get(i)).get("data");
-
-					XContentBuilder builder = XContentFactory.jsonBuilder()
-							.startObject();
+					XContentBuilder builder = XContentFactory.jsonBuilder().startObject();
 					String id = (String) story.get("name");
-					if (forward && i == 0)
-						mostRecentId = id;
+
+					// save the first id as most recent, "before" field could be
+					// null when getting the newest stories
+					if (i == 0)
+						firstId = id;
 					lastId = id;
 
 					builder.field("id", id);
@@ -279,27 +252,23 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 					builder.field("permalink", story.get("permalink"));
 					builder.field("created_utc", story.get("created_utc"));
 					builder.field("url", story.get("url"));
-
 					builder.endObject();
-					if (logger.isTraceEnabled())
-						logger.trace(
-								"adding to index {}, type {} with id {}: {}",
-								indexName, typeName, id, builder.string());
 
-					currentRequest
-							.add(Requests.indexRequest(indexName)
-									.type(typeName).id(id).create(true)
-									.source(builder));
+					if (logger.isTraceEnabled())
+						logger.trace("adding to index {}, type {} with id {}: {}", indexName, typeName, id,
+								builder.string());
+
+					currentRequest.add(Requests.indexRequest(indexName).type(typeName).id(id).create(true)
+							.source(builder));
 				}
-				
-				if (!forward || leastRecentId == null)
-					leastRecentId = lastId;
-				
+				if (stories.size() > 0)
+					logger.info("Got {} {} stories", stories.size(), forward ? "new" : "old");
+				else
+					logger.debug("Got 0 {} stories", forward ? "new" : "old");
+
 				processBulkIfNeeded();
-				
-				logger.trace("New mostRecentId: {} - New leastRecentId: {}",
-						mostRecentId, leastRecentId);
-				return storyCount;
+
+				return new RetrievedInterval(firstId, lastId, stories.size());
 			} finally {
 
 				if (inputStreamReader != null) {
@@ -317,8 +286,8 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 
 		private void processBulkIfNeeded() {
 			if (logger.isDebugEnabled())
-				logger.debug("currentRequest.numberOfActions={} - bulkSize={}",
-						currentRequest.numberOfActions(), bulkSize);
+				logger.debug("currentRequest.numberOfActions={} - bulkSize={}", currentRequest.numberOfActions(),
+						bulkSize);
 
 			if (currentRequest.numberOfActions() >= bulkSize) {
 				// execute the bulk operation
@@ -326,24 +295,21 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 
 				if (currentOnGoingBulks > dropThreshold) {
 					onGoingBulks.decrementAndGet();
-					logger.warn("dropping bulk, [{}] crossed threshold [{}]",
-							onGoingBulks, dropThreshold);
+					logger.warn("dropping bulk, [{}] crossed threshold [{}]", onGoingBulks, dropThreshold);
 				} else {
 					try {
 						logger.debug("executing bulk request");
-						currentRequest
-								.execute(new ActionListener<BulkResponse>() {
-									@Override
-									public void onResponse(
-											BulkResponse bulkResponse) {
-										onGoingBulks.decrementAndGet();
-									}
+						currentRequest.execute(new ActionListener<BulkResponse>() {
+							@Override
+							public void onResponse(BulkResponse bulkResponse) {
+								onGoingBulks.decrementAndGet();
+							}
 
-									@Override
-									public void onFailure(Throwable e) {
-										logger.warn("failed to execute bulk");
-									}
-								});
+							@Override
+							public void onFailure(Throwable e) {
+								logger.warn("failed to execute bulk");
+							}
+						});
 					} catch (Exception e) {
 						logger.warn("failed to process bulk", e);
 					}
