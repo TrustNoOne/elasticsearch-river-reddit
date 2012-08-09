@@ -35,7 +35,7 @@ import org.json.simple.JSONObject;
 import org.json.simple.JSONValue;
 
 /**
- *
+ * A reddit river for elasticsearch. 
  */
 public class RedditRiver extends AbstractRiverComponent implements River {
 
@@ -211,7 +211,7 @@ public class RedditRiver extends AbstractRiverComponent implements River {
 				logger.debug("Requesting Reddit stories at url {} ", currentAddress);
 				connection = (HttpURLConnection) new URL(currentAddress).openConnection();
 				connection.addRequestProperty("User-Agent",
-						"gcap's reddit crawler - email me at paradigma@gmail.com if there are any problems!");
+						"es reddit crawler");
 				connection.setReadTimeout(30000);
 				connection.connect();
 
